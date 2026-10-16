@@ -2,22 +2,34 @@
 """
 Генератор и проигрыватель тестового сигнала (tkinter).
 
-1. Ввод угла: -90...90, шаг 1, по умолчанию 0.
-2. Источник звука: WAV-файл или генерация.
-3. Кнопка «СТАРТ» (зелёная) -> «СТОП» (синяя, заполняется как «хот-бар»).
-4. Последовательность генерации — см. build_test_signal().
-5. Хуки для нашей функций: user_hook_on_start() / user_hook_on_stop().
-6. Папка «Угол_<N>» создаётся рядом со скриптом.
-7. Лог (время начала, описание, время конца) пишется в эту папку.
-8. Сгенерированный сигнал сохраняется там же как «Исходник.wav».
+Структура сигнала (все параметры — в файле config.json рядом со скриптом):
+  1)  общая пауза
+  2)  импульс СТАРТ
+  3)  общая пауза
+  4)  ГРУППА СИНУСОВ: частота от..до (шаг), длительность, пауза, уровни;
+      внутри одной частоты перебираются уровни, затем следующая частота
+  5)  общая пауза
+  6)  ГРУППА СВИПОВ: частота от..до (round_trip = туда-обратно),
+      длительность, пауза, уровни
+  7)  общая пауза
+  8)  ГРУППА ШУМА: тип (white/pink), длительность, пауза, уровни
+  9)  общая пауза
+  10) импульс СТОП
 
-Полная генерация ~64 минуты, «Исходник.wav» ~320 МБ (моно/16 бит/44100 Гц).
+Группа отключается заданием "duration_s": 0.
+
+Папка результатов: либо создаётся «Angle_<N>» рядом с программой,
+либо выбирается уже существующая (лог + «Исходник.wav» кладутся туда).
+
+Хуки: user_hook_on_start() / user_hook_on_stop() — см. внизу класса App.
 
 Зависимости:  pip install numpy sounddevice   (Python 3.7+)
 """
 
 import bisect
+import copy
 import datetime
+import json
 import os
 import queue
 import threading
@@ -42,18 +54,42 @@ except ImportError as _err:
     raise SystemExit(1)
 
 
-# ----------------------------- ПАРАМЕТРЫ ГЕНЕРАЦИИ -----------------------------
-SAMPLE_RATE = 44100               # Гц (поставьте 22050 — файл будет вдвое меньше)
-FREQ_START = 100                  # начальная частота, Гц
-FREQ_END = 2000                   # конечная частота, Гц
-FREQ_STEP = 10                    # шаг частоты, Гц
-TONE_DURATION = 4.0               # длительность тона, с
-PAUSE_DURATION = 1.0              # длительность паузы, с
-SWEEP_DURATION = 4.0              # длительность свипа, с
-POWER_LEVELS = (25, 50, 75, 100)  # уровни, %
-# «Мощность» здесь = доля амплитуды (power/100). Если нужен физический смысл
-# (мощность ~ амплитуда^2), замените в build_test_signal (power / 100.0)
-# на ((power / 100.0) ** 0.5).
+# ============================ ФАЙЛ НАСТРОЕК ====================================
+CONFIG_FILE = "config.json"
+
+DEFAULT_CONFIG = {
+    "sample_rate": 46875,
+    "start_silence_s": 1.0,                      # тишина ПЕРЕД импульсом СТАРТ
+    "end_silence_s": 1.0,                        # тишина ПОСЛЕ импульса СТОП
+    "general_pause_s": 2.0,                       # общие паузы (пп. 1,3,5,7,9)
+    "impulse": {                                  # импульсы СТАРТ/СТОП
+        "duration_ms": 5,                         # длительность, мс
+        "level_percent": 100,                     # уровень, % полной шкалы
+    },
+    "sine": {                                     # группа синусов
+        "freq_start_hz": 100,
+        "freq_end_hz": 2000,
+        "freq_step_hz": 100,
+        "duration_s": 2.0,
+        "pause_s": 1.0,
+        "levels_percent": [25, 50, 75, 100],
+    },
+    "sweep": {                                    # группа свипов
+        "freq_start_hz": 100,
+        "freq_end_hz": 2000,
+        "round_trip": True,                      # true = от->до->обратно
+        "duration_s": 10.0,
+        "pause_s": 1.0,
+        "levels_percent": [25, 50, 75, 100],
+    },
+    "noise": {                                    # группа шума
+        "type": "pink",                          # "white"/"белый" | "pink"/"розовый"
+        "duration_s": 10.0,
+        "pause_s": 1.0,
+        "levels_percent": [25, 50, 75, 100],
+        "seed": 12345,                            # зерно ГПСЧ: одна и та же
+    },                                            # реализация шума при запусках
+}
 
 
 class AbortedError(Exception):
@@ -61,82 +97,304 @@ class AbortedError(Exception):
 
 
 # ==============================================================================
+#                          ЗАГРУЗКА И ПРОВЕРКА НАСТРОЕК
+# ==============================================================================
+def _merge_defaults(cfg, defaults):
+    """Заполняет недостающие ключи значениями по умолчанию."""
+    out = dict(defaults)
+    for k, v in cfg.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge_defaults(v, out[k])
+        else:
+            out[k] = v
+    return out
+
+
+def _sect(cfg, name):
+    v = cfg.get(name, {})
+    if not isinstance(v, dict):
+        raise ValueError(f"{name}: ожидается группа параметров {{...}}, получено {v!r}")
+    return v
+
+
+def validate_config(cfg):
+    """Проверка значений настроек. Бросает ValueError с понятным описанием."""
+    def num(v, path_, mn=None, mx=None):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{path_}: ожидается число, получено {v!r}")
+        if mn is not None and v < mn:
+            raise ValueError(f"{path_}: должно быть >= {mn} (сейчас {v})")
+        if mx is not None and v > mx:
+            raise ValueError(f"{path_}: должно быть <= {mx} (сейчас {v})")
+        return v
+
+    def levels(v, path_):
+        if not isinstance(v, list) or not v:
+            raise ValueError(f"{path_}: нужен непустой список, например [25, 50, 75, 100]")
+        for i, x in enumerate(v):
+            num(x, f"{path_}[{i}]", 0, 100)
+        return v
+
+    fs = num(cfg.get("sample_rate"), "sample_rate", 8000, 192000)
+    num(cfg.get("general_pause_s"), "general_pause_s", 0)
+    num(cfg.get("start_silence_s"), "start_silence_s", 0)
+    num(cfg.get("end_silence_s"), "end_silence_s", 0)
+
+    imp = _sect(cfg, "impulse")
+    num(imp.get("duration_ms"), "impulse.duration_ms", 0)
+    num(imp.get("level_percent"), "impulse.level_percent", 0, 100)
+
+    s = _sect(cfg, "sine")
+    f1 = num(s.get("freq_start_hz"), "sine.freq_start_hz", 1, fs / 2)
+    f2 = num(s.get("freq_end_hz"), "sine.freq_end_hz", 1, fs / 2)
+    num(s.get("freq_step_hz"), "sine.freq_step_hz", 1)
+    num(s.get("duration_s"), "sine.duration_s", 0)
+    num(s.get("pause_s"), "sine.pause_s", 0)
+    if s.get("duration_s", 0) > 0:
+        if f2 < f1:
+            raise ValueError("sine.freq_end_hz должен быть >= sine.freq_start_hz")
+        levels(s.get("levels_percent"), "sine.levels_percent")
+
+    sw = _sect(cfg, "sweep")
+    wf1 = num(sw.get("freq_start_hz"), "sweep.freq_start_hz", 1, fs / 2)
+    wf2 = num(sw.get("freq_end_hz"), "sweep.freq_end_hz", 1, fs / 2)
+    if not isinstance(sw.get("round_trip", False), bool):
+        raise ValueError("sweep.round_trip: ожидается true/false")
+    num(sw.get("duration_s"), "sweep.duration_s", 0)
+    num(sw.get("pause_s"), "sweep.pause_s", 0)
+    if sw.get("duration_s", 0) > 0:
+        if wf1 == wf2:
+            raise ValueError("sweep: freq_start_hz и freq_end_hz должны различаться")
+        levels(sw.get("levels_percent"), "sweep.levels_percent")
+
+    nz = _sect(cfg, "noise")
+    typ = str(nz.get("type", "white")).strip().lower()
+    if typ not in ("white", "pink", "белый", "розовый"):
+        raise ValueError('noise.type: "white"/"белый" или "pink"/"розовый"')
+    num(nz.get("duration_s"), "noise.duration_s", 0)
+    num(nz.get("pause_s"), "noise.pause_s", 0)
+    if nz.get("duration_s", 0) > 0:
+        levels(nz.get("levels_percent"), "noise.levels_percent")
+    seed = nz.get("seed", 12345)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("noise.seed: ожидается целое число")
+
+
+def create_default_config(path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+
+
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("Ожидается JSON-объект {...} верхнего уровня")
+    cfg = _merge_defaults(raw, DEFAULT_CONFIG)
+    validate_config(cfg)
+    return cfg
+
+
+# ==============================================================================
 #                                ГЕНЕРАЦИЯ СИГНАЛА
 # ==============================================================================
-def build_test_signal(stop_flag=None):
-    """
-    Строит тестовый сигнал согласно ТЗ (п.4).
+def _freq_list(f1, f2, step):
+    f1, f2, step = int(f1), int(f2), max(1, int(step))
+    if f2 < f1:
+        f1, f2 = f2, f1
+    freqs = list(range(f1, f2 + 1, step))
+    if freqs[-1] != f2:
+        freqs.append(f2)          # «до частоты» включительно
+    return freqs
 
-    Возвращает:
-        buf      — np.ndarray[int16], моно;
-        segments — список (начало_с, длительность_с, описание) для лога/статуса;
-        total    — общая длительность, с.
+
+def _build_plan(cfg):
     """
-    n_freq = len(range(FREQ_START, FREQ_END + 1, FREQ_STEP))
-    n_pause = int(round(PAUSE_DURATION * SAMPLE_RATE))
-    n_tone = int(round(TONE_DURATION * SAMPLE_RATE))
-    n_sweep = int(round(SWEEP_DURATION * SAMPLE_RATE))
-    n_total = ((1 + (n_freq + 1) * len(POWER_LEVELS)) * n_pause
-               + n_freq * len(POWER_LEVELS) * n_tone
-               + len(POWER_LEVELS) * n_sweep)
+    План сигнала по ТЗ: список шагов (тип, n_сэмплов, параметры, описание).
+    Типы: pause | impulse | sine | sweep | noise.
+
+    Структура:
+      старт-тишина -> импульс СТАРТ -> общая пауза -> [синусы] -> общая пауза
+      -> [свипы] -> общая пауза -> [шум] -> общая пауза -> импульс СТОП
+      -> конечная тишина
+    """
+    fs = int(cfg["sample_rate"])
+    steps = []
+
+    def add(kind, n, params, desc):
+        steps.append((kind, int(n), params, desc))
+
+    gp = float(cfg["general_pause_s"])
+    n_gp = round(gp * fs)
+
+    imp = cfg["impulse"]
+    n_imp = round(float(imp["duration_ms"]) * fs / 1000.0)
+    imp_lvl = float(imp["level_percent"])
+
+
+    # 1-3. старт: тишина -> импульс -> общая пауза
+    n_start = round(float(cfg["start_silence_s"]) * fs)
+    if n_start > 0:
+        add("pause", n_start, None, f"Старт-тишина {float(cfg['start_silence_s']):g} с")
+    if n_imp > 0:
+        add("impulse", n_imp, imp_lvl,
+            f"Импульс СТАРТ ({float(imp['duration_ms']):g} мс, {imp_lvl:g} %)")
+    if n_gp > 0:
+        add("pause", n_gp, None, f"Общая пауза {float(cfg['general_pause_s']):g} с")
+
+    # 4. группа синусов: сначала уровни, потом следующая частота
+    s = cfg["sine"]
+    if float(s["duration_s"]) > 0 and s["levels_percent"]:
+        for f in _freq_list(s["freq_start_hz"], s["freq_end_hz"], s["freq_step_hz"]):
+            for lvl in s["levels_percent"]:
+                add("sine", round(float(s["duration_s"]) * fs), (int(f), float(lvl)),
+                    f"Синус {f} Гц, уровень {float(lvl):g} %, {float(s['duration_s']):g} с")
+                add("pause", round(float(s["pause_s"]) * fs), None,
+                    f"Пауза {float(s['pause_s']):g} с")
+    # 5. общая пауза
+    add("pause", n_gp, None, f"Общая пауза {gp:g} с")
+
+    # 6. группа свипов
+    sw = cfg["sweep"]
+    rt = bool(sw.get("round_trip", False))
+    if (float(sw["duration_s"]) > 0 and sw["levels_percent"]
+            and sw["freq_start_hz"] != sw["freq_end_hz"]):
+        f1, f2 = int(sw["freq_start_hz"]), int(sw["freq_end_hz"])
+        arrow = f"{f1}\u2192{f2}" + (f"\u2192{f1}" if rt else "")
+        for lvl in sw["levels_percent"]:
+            add("sweep", round(float(sw["duration_s"]) * fs), (f1, f2, rt, float(lvl)),
+                f"Свип {arrow} Гц (линейно), уровень {float(lvl):g} %, "
+                f"{float(sw['duration_s']):g} с")
+            add("pause", round(float(sw["pause_s"]) * fs), None,
+                f"Пауза {float(sw['pause_s']):g} с")
+    # 7. общая пауза
+    add("pause", n_gp, None, f"Общая пауза {gp:g} с")
+
+    # 8. группа шума
+    nz = cfg["noise"]
+    if float(nz["duration_s"]) > 0 and nz["levels_percent"]:
+        typ = str(nz["type"]).strip().lower()
+        typ = {"белый": "white", "розовый": "pink"}.get(typ, typ)
+        typ_ru = {"white": "белый", "pink": "розовый"}.get(typ, typ)
+        for lvl in nz["levels_percent"]:
+            add("noise", round(float(nz["duration_s"]) * fs), (typ, float(lvl)),
+                f"Шум {typ_ru}, уровень {float(lvl):g} %, {float(nz['duration_s']):g} с")
+            add("pause", round(float(nz["pause_s"]) * fs), None,
+                f"Пауза {float(nz['pause_s']):g} с")
+    # 9. общая пауза
+    if n_gp > 0:
+        add("pause", n_gp, None, f"Общая пауза {float(cfg['general_pause_s']):g} с")
+    # 10. импульс СТОП -> конечная тишина
+    if n_imp > 0:
+        add("impulse", n_imp, imp_lvl,
+            f"Импульс СТОП ({float(imp['duration_ms']):g} мс, {imp_lvl:g} %)")
+    n_end = round(float(cfg["end_silence_s"]) * fs)
+    if n_end > 0:
+        add("pause", n_end, None, f"Конец-тишина {float(cfg['end_silence_s']):g} с")
+
+    return steps
+
+
+def generation_info(cfg):
+    """(длительность_с, размер_wav_МБ) по текущим настройкам."""
+    steps = _build_plan(cfg)
+    fs = int(cfg["sample_rate"])
+    total = sum(n for _k, n, _p, _d in steps) / fs
+    size_mb = total * fs * 2 / (1024.0 * 1024.0)
+    return total, size_mb
+
+
+def _pink_noise(n, rng):
+    """Розовый шум (спектральная плотность ~ 1/f), FFT-метод."""
+    white = rng.standard_normal(n)
+    spec = np.fft.rfft(white)
+    f = np.fft.rfftfreq(n, d=1.0)
+    f[0] = f[1]                       # избежать деления на ноль
+    spec = spec / np.sqrt(f)          # амплитуда ~ 1/sqrt(f)
+    return np.fft.irfft(spec, n)
+
+
+def build_test_signal(cfg, stop_flag=None):
+    """
+    Строит сигнал по плану _build_plan(cfg).
+
+    Уровни синуса/свипа — доля амплитуды (level % полной шкалы).
+    Уровень шума — по ПИКОВОМУ значению (пик = level % полной шкалы),
+    чтобы гарантированно не было клиппинга; RMS белого шума при этом
+    примерно в 4-5 раз ниже пика.
+
+    Возвращает: (buf int16 моно, segments [(начало_с, длительность_с, описание)],
+    total_с).
+    """
+    fs = int(cfg["sample_rate"])
+    steps = _build_plan(cfg)
+    n_total = sum(n for _k, n, _p, _d in steps)
 
     buf = np.zeros(n_total, dtype=np.int16)
     segments = []
     pos = 0
 
-    def add(arr, desc):
-        nonlocal pos
-        n = len(arr)
-        segments.append((pos / SAMPLE_RATE, n / SAMPLE_RATE, desc))
-        buf[pos:pos + n] = arr
-        pos += n
-
     def check_stop():
         if stop_flag is not None and stop_flag.is_set():
             raise AbortedError()
 
-    silence = np.zeros(n_pause, dtype=np.int16)
-    t_tone = np.arange(n_tone, dtype=np.float64) / SAMPLE_RATE
+    silence_cache = {}
+    sweep_cache = {}
+    noise_cache = {}
+    rng = np.random.default_rng(int(cfg.get("noise", {}).get("seed", 12345)))
 
-    # форма свипа 100->2000->100 Гц (общая для всех уровней)
-    half = n_sweep // 2
-    f_inst = np.concatenate((
-        np.linspace(FREQ_START, FREQ_END, half),
-        np.linspace(FREQ_END, FREQ_START, n_sweep - half)))
-    sweep_wave = np.sin(2.0 * np.pi * np.cumsum(f_inst) / SAMPLE_RATE)
-
-    # 4.1 — начальная пауза
-    add(silence, f"Пауза {PAUSE_DURATION:.0f} с")
-
-    # 4.2...4.X — ступени по частоте 100..2000 Гц с шагом 10 Гц
-    for freq in range(FREQ_START, FREQ_END + 1, FREQ_STEP):
-        for power in POWER_LEVELS:
-            check_stop()
-            amp = (power / 100.0) * 32767.0
-            add((amp * np.sin(2.0 * np.pi * freq * t_tone)).astype(np.int16),
-                f"Синус {freq} Гц, мощность {power} %, {TONE_DURATION:.0f} с")
-            add(silence, f"Пауза {PAUSE_DURATION:.0f} с")
-
-    # 4.X1...4.X3 — свипы 100->2000->100 Гц на 25/50/75/100 %
-    for power in POWER_LEVELS:
+    for kind, n, params, desc in steps:
         check_stop()
-        amp = (power / 100.0) * 32767.0
-        add((amp * sweep_wave).astype(np.int16),
-            f"Свип {FREQ_START}->{FREQ_END}->{FREQ_START} Гц (линейно), "
-            f"мощность {power} %, {SWEEP_DURATION:.0f} с")
-        add(silence, f"Пауза {PAUSE_DURATION:.0f} с")
 
-    return buf[:pos], segments, pos / SAMPLE_RATE
+        if kind == "pause":
+            arr = silence_cache.get(n)
+            if arr is None:
+                arr = np.zeros(n, dtype=np.int16)
+                silence_cache[n] = arr
 
+        elif kind == "impulse":
+            lvl = float(params)
+            arr = np.full(n, int(round(lvl / 100.0 * 32767.0)), dtype=np.int16)
 
-def generation_info():
-    """(длительность_с, размер_wav_МБ) генерации по текущим параметрам."""
-    n_freq = len(range(FREQ_START, FREQ_END + 1, FREQ_STEP))
-    total = (PAUSE_DURATION
-             + n_freq * len(POWER_LEVELS) * (TONE_DURATION + PAUSE_DURATION)
-             + len(POWER_LEVELS) * (SWEEP_DURATION + PAUSE_DURATION))
-    size_mb = total * SAMPLE_RATE * 2 / (1024.0 * 1024.0)
-    return total, size_mb
+        elif kind == "sine":
+            f, lvl = params
+            t = np.arange(n, dtype=np.float64) / fs
+            arr = ((lvl / 100.0) * 32767.0 * np.sin(2.0 * np.pi * f * t)).astype(np.int16)
+
+        elif kind == "sweep":
+            f1, f2, rt, lvl = params
+            key = (n, f1, f2, rt)
+            wave = sweep_cache.get(key)
+            if wave is None:
+                if rt:                                    # от->до->обратно
+                    half = n // 2
+                    f_inst = np.concatenate((
+                        np.linspace(f1, f2, half),
+                        np.linspace(f2, f1, n - half)))
+                else:                                     # от->до
+                    f_inst = np.linspace(f1, f2, n)
+                wave = np.sin(2.0 * np.pi * np.cumsum(f_inst) / fs)
+                sweep_cache[key] = wave
+            arr = ((lvl / 100.0) * 32767.0 * wave).astype(np.int16)
+
+        else:  # noise
+            typ, lvl = params
+            base = noise_cache.get(n)
+            if base is None:
+                if typ == "pink":
+                    base = _pink_noise(n, rng)
+                else:
+                    base = rng.standard_normal(n)
+                base = base / np.max(np.abs(base))        # пик = 1.0
+                noise_cache[n] = base
+            arr = ((lvl / 100.0) * 32767.0 * base).astype(np.int16)
+
+        segments.append((pos / fs, n / fs, desc))
+        buf[pos:pos + n] = arr
+        pos += n
+
+    return buf[:pos], segments, pos / fs
 
 
 # ==============================================================================
@@ -260,6 +518,31 @@ class App(tk.Tk):
         self._last_angle = None
         self._last_folder = None
         self._last_log = None
+        self._last_cfg = None
+
+        # ---------- файл настроек ----------
+        try:
+            self._base_dir = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            self._base_dir = os.getcwd()
+        self._cfg_path = os.path.join(self._base_dir, CONFIG_FILE)
+
+        if not os.path.exists(self._cfg_path):
+            try:
+                create_default_config(self._cfg_path)
+                messagebox.showinfo(
+                    "Файл настроек",
+                    f"Создан файл настроек по умолчанию:\n{self._cfg_path}\n\n"
+                    "Все параметры генерации (общие паузы, импульсы, синусы,\n"
+                    "свипы, шум) задаются в нём — можно править любым\n"
+                    "текстовым редактором и нажимать «Перечитать».")
+            except OSError as exc:
+                messagebox.showerror("Ошибка",
+                                     f"Не удалось создать файл настроек:\n{exc}")
+                raise SystemExit(1)
+
+        self._cfg = None
+        self._load_config(show_error=True)   # при ошибке — встроенные значения
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -282,9 +565,29 @@ class App(tk.Tk):
                                       command=self._on_scale)
         self._angle_scale.grid(row=0, column=2, sticky="ew", pady=4)
 
+        # ---- 1а. Папка результатов ----
+        fold = ttk.LabelFrame(frm, text="Папка результатов (лог + «Исходник.wav»)",
+                              padding=(10, 6))
+        fold.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        self._folder_mode_var = tk.StringVar(value="new")
+        ttk.Radiobutton(fold, text="Создавать «Angle_<N>» рядом с программой",
+                        variable=self._folder_mode_var, value="new",
+                        command=self._update_folder_ui).pack(side="left")
+        ttk.Radiobutton(fold, text="Существующая:",
+                        variable=self._folder_mode_var, value="existing",
+                        command=self._update_folder_ui).pack(side="left",
+                                                             padx=(14, 0))
+        self._folder_path_var = tk.StringVar()
+        self._folder_entry = ttk.Entry(fold, textvariable=self._folder_path_var,
+                                       width=34)
+        self._folder_entry.pack(side="left", padx=(6, 0))
+        self._folder_browse_btn = ttk.Button(fold, text="Обзор…", width=9,
+                                             command=self._browse_folder)
+        self._folder_browse_btn.pack(side="left", padx=(8, 0))
+
         # ---- 2. Источник звука ----
         src = ttk.LabelFrame(frm, text="Источник звука", padding=(10, 6))
-        src.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        src.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         self._source_var = tk.StringVar(value="gen")
         ttk.Radiobutton(src, text="WAV-файл", variable=self._source_var, value="wav",
                         command=self._update_source_ui).pack(side="left")
@@ -297,23 +600,35 @@ class App(tk.Tk):
                                        command=self._browse_wav)
         self._browse_btn.pack(side="left", padx=(8, 0))
 
+        # ---- 2а. Файл настроек генерации ----
+        self._cfg_path_var = tk.StringVar(value=self._cfg_path)
+        cfgf = ttk.Frame(frm)
+        cfgf.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Label(cfgf, text="Настройки генерации:").pack(side="left")
+        ttk.Label(cfgf, textvariable=self._cfg_path_var, foreground="#555").pack(
+            side="left", padx=(6, 10))
+        self._reload_btn = ttk.Button(cfgf, text="Перечитать", width=11,
+                                       command=self._reload_config)
+        self._reload_btn.pack(side="left")
+
         # информация о генерации
         self._info_var = tk.StringVar(value="")
         ttk.Label(frm, textvariable=self._info_var, foreground="#555",
-                  width=80, anchor="w").grid(row=2, column=0, columnspan=3,
+                  width=80, anchor="w").grid(row=4, column=0, columnspan=3,
                                              sticky="w", padx=4, pady=(0, 6))
 
         # ---- 3. Кнопка СТАРТ/СТОП ----
         self._hotbtn = HotButton(frm, command=self._on_hotbutton)
-        self._hotbtn.grid(row=3, column=0, columnspan=3, pady=(2, 8))
+        self._hotbtn.grid(row=5, column=0, columnspan=3, pady=(2, 8))
 
         # ---- 4. Статус ----
         self._status_var = tk.StringVar(value="Готов к работе")
         ttk.Label(frm, textvariable=self._status_var, anchor="w", justify="left",
-                  wraplength=620).grid(row=4, column=0, columnspan=3,
+                  wraplength=620).grid(row=6, column=0, columnspan=3,
                                        sticky="w", padx=4, pady=(2, 4))
 
         self._update_source_ui()
+        self._update_folder_ui()
 
     # ------------------------------------------------------------- угол ----
     def _on_scale(self, value):
@@ -336,6 +651,28 @@ class App(tk.Tk):
             v = 0
         return max(-90, min(90, v))
 
+    # --------------------------------------------------------- настройки ----
+    def _load_config(self, show_error=True):
+        try:
+            self._cfg = load_config(self._cfg_path)
+            return True
+        except Exception as exc:
+            if show_error:
+                messagebox.showerror(
+                    "Ошибка в файле настроек",
+                    f"{self._cfg_path}\n\n{exc}\n\n"
+                    "Используются встроенные настройки по умолчанию\n"
+                    "(исправьте файл и нажмите «Перечитать»).")
+            self._cfg = copy.deepcopy(DEFAULT_CONFIG)
+            return False
+
+    def _reload_config(self):
+        if self._load_config(show_error=True):
+            self._update_source_ui()
+            total, size_mb = generation_info(self._cfg)
+            self._status_var.set(f"Настройки перечитаны: генерация "
+                                 f"{self._fmt_time(total)} (~{size_mb:.0f} МБ)")
+
     # ---------------------------------------------------------- источник ----
     def _update_source_ui(self):
         is_wav = self._source_var.get() == "wav"
@@ -345,16 +682,31 @@ class App(tk.Tk):
         if is_wav:
             self._info_var.set("")
         else:
-            total, size_mb = generation_info()
-            self._info_var.set(f"Генерация: {self._fmt_time(total)} "
-                               f"(~{size_mb:.0f} МБ, {FREQ_START}–{FREQ_END} Гц, шаг {FREQ_STEP} Гц)")
+            try:
+                total, size_mb = generation_info(self._cfg)
+                self._info_var.set(f"Генерация: {self._fmt_time(total)} "
+                                   f"(~{size_mb:.0f} МБ)")
+            except Exception as exc:
+                self._info_var.set(f"Ошибка в настройках: {exc}")
 
+    def _update_folder_ui(self):
+        is_new = self._folder_mode_var.get() == "new"
+        state = "disabled" if is_new else "normal"
+        self._folder_entry.configure(state=state)
+        self._folder_browse_btn.configure(state=state)
+
+    # ----------------------------------------------------------- выбор... ----
     def _browse_wav(self):
         path = filedialog.askopenfilename(
             title="Выбор WAV-файла",
             filetypes=[("WAV-файлы", "*.wav *.wave"), ("Все файлы", "*.*")])
         if path:
             self._wav_path_var.set(path)
+
+    def _browse_folder(self):
+        path = filedialog.askdirectory(title="Выбор папки для результатов")
+        if path:
+            self._folder_path_var.set(path)
 
     # ---------------------------------------------------- СТАРТ / СТОП ----
     def _on_hotbutton(self):
@@ -379,25 +731,42 @@ class App(tk.Tk):
 
         if mode == "wav":
             if not wav_path:
-                messagebox.showwarning("Нет файла", "Выберите WAV-файл (кнопка «Обзор…»).")
+                messagebox.showwarning("Нет файла",
+                                       "Выберите WAV-файл (кнопка «Обзор…»).")
                 return
             if not os.path.isfile(wav_path):
-                messagebox.showwarning("Файл не найден", f"Файл не найден:\n{wav_path}")
+                messagebox.showwarning("Файл не найден",
+                                       f"Файл не найден:\n{wav_path}")
+                return
+        else:
+            try:
+                validate_config(self._cfg)
+            except ValueError as exc:
+                messagebox.showerror("Ошибка в настройках", str(exc))
                 return
 
         angle = self._get_angle()
 
-        # ---- 6. папка «Угол_<N>» рядом с программой ----
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            base_dir = os.getcwd()
-        folder = os.path.join(base_dir, f"Угол_{angle}")
-        try:
-            os.makedirs(folder, exist_ok=True)
-        except OSError as exc:
-            messagebox.showerror("Ошибка", f"Не удалось создать папку:\n{folder}\n\n{exc}")
-            return
+        # ---- папка результатов: новая или существующая ----
+        if self._folder_mode_var.get() == "new":
+            folder = os.path.join(self._base_dir, f"Angle_{angle}")
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Ошибка", f"Не удалось создать папку:\n{folder}\n\n{exc}")
+                return
+        else:
+            folder = self._folder_path_var.get().strip()
+            if not folder:
+                messagebox.showwarning(
+                    "Нет папки", "Выберите существующую папку (кнопка «Обзор…»).")
+                return
+            folder = os.path.abspath(folder)
+            if not os.path.isdir(folder):
+                messagebox.showwarning("Папка не найдена",
+                                       f"Папка не найдена:\n{folder}")
+                return
 
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_path = os.path.join(folder, f"Лог_{stamp}.txt")
@@ -407,6 +776,7 @@ class App(tk.Tk):
         self._last_angle = angle
         self._last_folder = folder
         self._last_log = log_path
+        self._last_cfg = copy.deepcopy(self._cfg)
 
         # ==================================================================
         # ХУК СТАРТ (п.5 ТЗ): вызов вашей функции при старте.
@@ -433,20 +803,22 @@ class App(tk.Tk):
         self._seg_offsets = None
         self._stop_hook_called = False
         self._click_guard_until = time.monotonic() + 0.4
+        self._reload_btn.configure(state="disabled")
 
         self._hotbtn.set_active(True)
         self._hotbtn.set_progress(0.0)
         self._status_var.set("Подготовка…")
 
-        self._worker = threading.Thread(target=self._worker_run,
-                                        args=(mode, angle, folder, log_path,
-                                              wav_path, source_wav),
-                                        daemon=True)
+        self._worker = threading.Thread(
+            target=self._worker_run,
+            args=(mode, angle, folder, log_path, wav_path, source_wav,
+                  self._last_cfg),
+            daemon=True)
         self._worker.start()
         self.after(100, self._poll)
 
     # ============================== РАБОЧИЙ ПОТОК ==========================
-    def _worker_run(self, mode, angle, folder, log_path, wav_path, source_wav):
+    def _worker_run(self, mode, angle, folder, log_path, wav_path, source_wav, cfg):
         log = None
         reason = "finished"
         error_text = None
@@ -460,7 +832,7 @@ class App(tk.Tk):
             log.write("=" * 72 + "\n")
             log.write("ЛОГ ЗАПУСКА\n")
             log.write(f"Дата/время начала : {start_dt:%Y-%m-%d %H:%M:%S}\n")
-            log.write(f"Угол              : {angle}\n")
+            log.write(f"Angle            : {angle}\n")
             log.write(f"Режим             : {'WAV-файл' if mode == 'wav' else 'Генерация'}\n")
             log.write(f"Папка             : {folder}\n")
             if mode == "wav":
@@ -469,7 +841,11 @@ class App(tk.Tk):
                 log.write(f"Имя файла: {os.path.basename(wav_path)}\n")
                 log.write(f"Путь:     {wav_path}\n")
             else:
+                log.write(f"Файл настроек     : {self._cfg_path}\n")
                 log.write(f"[{start_dt:%H:%M:%S}] СТАРТ: генерация тестового сигнала\n")
+                log.write("Параметры генерации:\n")
+                for line in json.dumps(cfg, ensure_ascii=False, indent=2).splitlines():
+                    log.write("    " + line + "\n")
             log.write("=" * 72 + "\n\n")
             log.flush()
 
@@ -479,8 +855,8 @@ class App(tk.Tk):
                 data, fs, total = load_wav(wav_path)
                 log.write(f"Длительность: {total:.1f} с\n\n")
             else:
-                status("Генерация сигнала (несколько секунд)…")
-                buf, segments, total = build_test_signal(self._stop_flag)
+                status("Генерация сигнала…")
+                buf, segments, total = build_test_signal(cfg, self._stop_flag)
 
                 if self._stop_flag.is_set():
                     raise AbortedError()
@@ -488,7 +864,8 @@ class App(tk.Tk):
                 # ---- 8. сохранение «Исходник.wav» ----
                 status("Сохранение «Исходник.wav»…")
                 try:
-                    save_wav_int16(source_wav, buf, SAMPLE_RATE, self._stop_flag)
+                    save_wav_int16(source_wav, buf, int(cfg["sample_rate"]),
+                                   self._stop_flag)
                 except AbortedError:
                     try:
                         os.remove(source_wav)     # удалить недописанный файл
@@ -500,7 +877,7 @@ class App(tk.Tk):
                 log.write(f"Длительность: {total:.1f} с\n\n")
                 log.flush()
 
-                data, fs = buf, SAMPLE_RATE
+                data, fs = buf, int(cfg["sample_rate"])
                 self._segments = segments
                 self._seg_offsets = [s[0] for s in segments]
 
@@ -604,6 +981,7 @@ class App(tk.Tk):
         self._playback_started = False
         self._worker = None
         self._hotbtn.set_active(False)
+        self._reload_btn.configure(state="normal")
 
         reason = self._done_reason or "finished"
         if reason == "error":
@@ -635,8 +1013,9 @@ class App(tk.Tk):
 
     def _on_close(self):
         if self._active:
-            if not messagebox.askyesno("Выход",
-                                       "Воспроизведение ещё не завершено.\nОстановить и выйти?"):
+            if not messagebox.askyesno(
+                    "Выход",
+                    "Воспроизведение ещё не завершено.\nОстановить и выйти?"):
                 return
             self._stop_flag.set()
             try:
@@ -651,13 +1030,14 @@ class App(tk.Tk):
     # ######################################################################
     # #############  МЕСТО ДЛЯ ВАШЕЙ ФУНКЦИИ ПРИ СТАРТЕ  (п.5)  ############
     # ######################################################################
-    # Вызывается при нажатии кнопки «СТАРТ», в потоке GUI, сразу после
-    # создания папки «Угол_<N>» и подготовки лога (до начала звука).
+    # Вызывается при нажатии кнопки «СТАРТ», в потоке GUI, после выбора папки
+    # и подготовки лога (до начала звука).
     #
     # Доступные данные:
     #   self._last_angle  — угол (int, -90..90)
-    #   self._last_folder — путь к папке «Угол_<N>»
+    #   self._last_folder — папка результатов (созданная или выбранная)
     #   self._last_log    — путь к лог-файлу
+    #   self._last_cfg    — словарь настроек генерации (config.json)
     # ######################################################################
     def user_hook_on_start(self):
         # ---- ВСТАВЬТЕ ВАШ КОД ЗДЕСЬ ----
@@ -668,12 +1048,10 @@ class App(tk.Tk):
     # ######################################################################
     # ###########  МЕСТО ДЛЯ ВАШЕЙ ФУНКЦИИ ПРИ ОСТАНОВКЕ  (п.5)  ############
     # ######################################################################
-    # Вызывается при остановке: либо вручную (кнопка «СТОП»), либо
-    # автоматически после окончания воспроизведения, либо при ошибке.
+    # Вызывается при остановке: вручную (кнопка «СТОП»), автоматически после
+    # окончания воспроизведения или при ошибке.
     #
-    # reason: "manual"   — нажата кнопка «СТОП»;
-    #         "finished" — воспроизведение закончилось само;
-    #         "error"    — произошла ошибка.
+    # reason: "manual" | "finished" | "error"
     # ######################################################################
     def user_hook_on_stop(self, reason):
         # ---- ВСТАВЬТЕ ВАШ КОД ЗДЕСЬ ----
