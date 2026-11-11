@@ -23,6 +23,10 @@
 
 Хуки: user_hook_on_start() / user_hook_on_stop() — см. внизу класса App.
 
+Приём UDP-пакетов: при нажатии «СТАРТ» запускается приёмник, который
+слушает указанный порт и сохраняет пакеты в бинарный файл в папке
+результатов. Останавливается при нажатии «СТОП» или по завершении.
+
 Зависимости:  pip install numpy sounddevice   (Python 3.7+)
 """
 
@@ -32,6 +36,9 @@ import datetime
 import json
 import os
 import queue
+import socket
+import subprocess                     # +++ для ping
+import sys                            # +++ для определения заморозки PyInstaller
 import threading
 import time
 import wave
@@ -89,6 +96,16 @@ DEFAULT_CONFIG = {
         "levels_percent": [25, 50, 75, 100],
         "seed": 12345,                            # зерно ГПСЧ: одна и та же
     },                                            # реализация шума при запусках
+    # +++ секция приёмника UDP-пакетов +++
+    "udp_receiver": {
+        "enabled": False,                        # включить приём при старте
+        "local_port": 45920,                     # локальный порт для прослушивания
+        "source_ip": "192.168.0.pi9",             # IP источника ("" = любой)
+        "packet_size": 1293,                     # ожидаемый размер пакета, байт
+        "header_size": 13,                       # размер заголовка в пакете
+        "filename": "data.bin",                  # имя файла (в папке результатов)
+        "strip_header": True,                   # True = писать только данные без заголовка
+    },
 }
 
 
@@ -179,6 +196,16 @@ def validate_config(cfg):
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("noise.seed: ожидается целое число")
 
+    # +++ проверка секции udp_receiver +++
+    udp = _sect(cfg, "udp_receiver")
+    if not isinstance(udp.get("enabled", False), bool):
+        raise ValueError("udp_receiver.enabled: ожидается true/false")
+    num(udp.get("local_port"), "udp_receiver.local_port", 1, 65535)
+    num(udp.get("packet_size"), "udp_receiver.packet_size", 1)
+    num(udp.get("header_size", 13), "udp_receiver.header_size", 0)
+    if not isinstance(udp.get("strip_header", False), bool):
+        raise ValueError("udp_receiver.strip_header: ожидается true/false")
+
 
 def create_default_config(path):
     with open(path, "w", encoding="utf-8") as f:
@@ -231,7 +258,6 @@ def _build_plan(cfg):
     imp = cfg["impulse"]
     n_imp = round(float(imp["duration_ms"]) * fs / 1000.0)
     imp_lvl = float(imp["level_percent"])
-
 
     # 1-3. старт: тишина -> импульс -> общая пауза
     n_start = round(float(cfg["start_silence_s"]) * fs)
@@ -367,12 +393,12 @@ def build_test_signal(cfg, stop_flag=None):
             key = (n, f1, f2, rt)
             wave = sweep_cache.get(key)
             if wave is None:
-                if rt:                                    # от->до->обратно
+                if rt:                                    # от->да->обратно
                     half = n // 2
                     f_inst = np.concatenate((
                         np.linspace(f1, f2, half),
                         np.linspace(f2, f1, n - half)))
-                else:                                     # от->до
+                else:                                     # от->да
                     f_inst = np.linspace(f1, f2, n)
                 wave = np.sin(2.0 * np.pi * np.cumsum(f_inst) / fs)
                 sweep_cache[key] = wave
@@ -438,6 +464,67 @@ def save_wav_int16(path, buf, fs, stop_flag=None, chunk=1 << 20):
                 raise AbortedError()
             wf.writeframes(buf[i:i + chunk].tobytes())
 
+def convert_udp_bin_to_wav(bin_path, wav_path=None,
+                            sample_rate=46875, n_channels=4,
+                            channel_size=160, strip_header=True,
+                            header_size=13):
+    """
+    Конвертирует бинарный файл от UDP-приёмника в многоканальный WAV.
+
+    Структура одного пакета в файле:
+      - заголовок header_size байт (только если strip_header=False)
+      - данные: n_channels × channel_size семплов int16,
+        уложенных блочно: [канал1(160), канал2(160), канал3(160), канал4(160)]
+
+    WAV пишется в interleaved-формате:
+      [ch1_s0, ch2_s0, ch3_s0, ch4_s0, ch1_s1, ch2_s1, ...]
+
+    Возвращает: (wav_path, n_packets, n_total_samples)
+    """
+    if wav_path is None:
+        base, _ = os.path.splitext(bin_path)
+        wav_path = base + ".wav"
+
+    samples_per_packet = n_channels * channel_size
+    bytes_per_packet = samples_per_packet * 2 if strip_header \
+        else header_size + samples_per_packet * 2
+
+    raw = np.fromfile(bin_path, dtype=np.uint8)
+    n_packets = len(raw) // bytes_per_packet
+    if n_packets == 0:
+        raise ValueError(
+            f"Файл слишком короткий для конвертации: {len(raw)} байт, "
+            f"нужно минимум {bytes_per_packet}")
+
+    # Отрезаем возможный «хвост» некратной длины
+    raw = raw[:n_packets * bytes_per_packet]
+    packets = raw.reshape(n_packets, bytes_per_packet)
+
+    # Убираем заголовок, если он есть в файле
+    if not strip_header:
+        packets = packets[:, header_size:]
+
+    # Переинтерпретируем байты как int16: форма (n_packets, 640)
+    samples = packets.view(np.int16)
+
+    # Разбиваем по каналам и собираем матрицу (N_total, n_channels)
+    channels = []
+    for ch in range(n_channels):
+        ch_data = samples[:, ch * channel_size:(ch + 1) * channel_size]
+        channels.append(ch_data.reshape(-1))
+
+    matrix = np.stack(channels, axis=1)         # (N_total, n_channels) int16
+
+    # Interleave для WAV: (N_total, n_channels) -> (N_total * n_channels,)
+    interleaved = matrix.reshape(-1)
+
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(interleaved.tobytes())
+
+    return wav_path, n_packets, matrix.shape[0]
 
 # ==============================================================================
 #                            КНОПКА «ХОТ-БАР» (п.3)
@@ -487,6 +574,255 @@ class HotButton(tk.Canvas):
                          text="СТОП" if self._active else "СТАРТ",
                          fill=self.COLOR_TEXT, font=("Arial", 15, "bold"))
 
+# ==============================================================================
+#                       ИНДИКАТОР СВЯЗИ С ИСТОЧНИКОМ  (+++)
+# ==============================================================================
+class PingIndicator(tk.Canvas):
+    """Индикатор связи с источником UDP (кликабельный кружок).
+
+    Цвета:
+      зелёный  — ping есть (источник доступен)
+      красный  — ping отсутствует
+      серый    — неизвестно / идёт проверка
+    """
+
+    COLOR_OK = "#22c55e"        # зелёный
+    COLOR_FAIL = "#ef4444"      # красный
+    COLOR_UNKNOWN = "#9ca3af"   # серый
+    COLOR_OUTLINE = "#374151"
+
+    def __init__(self, master, size=20, on_click=None):
+        super().__init__(master, width=size, height=size,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._size = size
+        self._on_click = on_click
+        self._state = "unknown"
+        self.bind("<Button-1>", self._handle_click)
+        self._draw()
+
+    def _handle_click(self, _event):
+        if self._on_click:
+            self._on_click()
+
+    def set_state(self, state):
+        """state: 'ok' | 'fail' | 'unknown'"""
+        self._state = state
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        color = {
+            "ok": self.COLOR_OK,
+            "fail": self.COLOR_FAIL,
+            "unknown": self.COLOR_UNKNOWN,
+        }.get(self._state, self.COLOR_UNKNOWN)
+        r = self._size // 2 - 2
+        cx = cy = self._size // 2
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                         fill=color, outline=self.COLOR_OUTLINE, width=1)
+
+
+def check_ping(ip, timeout=2):
+    """Пингует IP-адрес. Возвращает True при успехе, False при неудаче."""
+    if not ip:
+        return False
+    is_windows = os.name == "nt"
+    count_param = "-n" if is_windows else "-c"
+    timeout_param = "-w" if is_windows else "-W"
+    timeout_val = str(timeout * 1000) if is_windows else str(timeout)
+
+    kwargs = dict(
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout + 3,
+    )
+    if is_windows:
+        # CREATE_NO_WINDOW — не показывать консоль при запуске ping
+        kwargs["creationflags"] = 0x08000000
+
+    try:
+        result = subprocess.run(
+            ["ping", count_param, "1", timeout_param, timeout_val, ip],
+            **kwargs,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+# ==============================================================================
+#                       ПРИЁМНИК UDP-ПАКЕТОВ  (+++)
+# ==============================================================================
+class UdpReceiver:
+    """Приёмник UDP-пакетов с сохранением в бинарный файл.
+
+    Запускается в отдельном потоке. Слушает указанный локальный порт,
+    опционально фильтрует пакеты по IP-адресу источника и записывает
+    их в файл (сырые байты — как пришли, либо без заголовка).
+
+    Структура пакета (согласно ТЗ):
+      - общий размер:  1293 байта
+      - заголовок:      13 байт
+      - данные:         1280 байт = 640 семплов int16_t
+      - частота:        46875 Гц
+      - распределение по каналам: 1-й канал — 16 семплов,
+        далее по 160 семплов на канал
+    """
+
+    def __init__(self, local_port, output_path, source_ip="",
+                 packet_size=1293, strip_header=False, header_size=13,
+                 status_callback=None):
+        self._local_port = int(local_port)
+        self._output_path = output_path
+        self._source_ip = source_ip.strip() if source_ip else ""
+        self._packet_size = int(packet_size)
+        self._strip_header = bool(strip_header)
+        self._header_size = int(header_size)
+        self._status_callback = status_callback
+
+        self._stop_flag = threading.Event()
+        self._thread = None
+        self._sock = None
+        self._file = None
+
+        self._packets_received = 0
+        self._bytes_received = 0
+        self._packets_bad_size = 0
+        self._packets_bad_source = 0
+        self._error = None
+        self._lock = threading.Lock()
+        self._running = False
+
+    # ------------------------------------------------------------- API ----
+
+    def start(self):
+        """Запуск потока приёма."""
+        self._stop_flag.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout=3.0):
+        """Остановка потока приёма (блокирует до timeout секунд)."""
+        self._stop_flag.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        self._thread = None
+        self._running = False
+
+    def is_running(self):
+        return self._running
+
+    def get_stats(self):
+        """Возвращает словарь со статистикой приёма."""
+        with self._lock:
+            return {
+                "packets": self._packets_received,
+                "bytes": self._bytes_received,
+                "bad_size": self._packets_bad_size,
+                "bad_source": self._packets_bad_source,
+                "error": self._error,
+                "running": self._running,
+            }
+
+    # -------------------------------------------------------- внутреннее ----
+
+    def _set_status(self, text):
+        if self._status_callback:
+            try:
+                self._status_callback(text)
+            except Exception:
+                pass
+
+    def _run(self):
+        """Рабочий цикл приёмника."""
+        self._running = True
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Увеличиваем приёмный буфер ядра до 4 МБ
+            try:
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                                      4 * 1024 * 1024)
+            except Exception:
+                pass
+            self._sock.bind(("0.0.0.0", self._local_port))
+            self._sock.settimeout(0.5)
+        except Exception as exc:
+            self._error = f"Не удалось открыть сокет: {exc}"
+            self._set_status(f"Ошибка UDP: {exc}")
+            self._running = False
+            return
+
+        try:
+            self._file = open(self._output_path, "wb")
+        except Exception as exc:
+            self._error = f"Не удалось открыть файл: {exc}"
+            self._set_status(f"Ошибка UDP: {exc}")
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._running = False
+            return
+
+        self._set_status(
+            f"Приём UDP: порт {self._local_port}"
+            + (f", источник {self._source_ip}" if self._source_ip else " (любой)")
+            + f"  ->  {os.path.basename(self._output_path)}")
+
+        try:
+            while not self._stop_flag.is_set():
+                try:
+                    data, addr = self._sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                # Фильтр по IP источника
+                if self._source_ip and addr[0] != self._source_ip:
+                    with self._lock:
+                        self._packets_bad_source += 1
+                    continue
+
+                # Проверка размера пакета
+                if len(data) != self._packet_size:
+                    with self._lock:
+                        self._packets_bad_size += 1
+                    continue
+
+                # Опционально отрезаем заголовок
+                if self._strip_header and len(data) > self._header_size:
+                    write_data = data[self._header_size:]
+                else:
+                    write_data = data
+
+                try:
+                    self._file.write(write_data)
+                    self._file.flush()
+                except Exception as exc:
+                    self._error = f"Ошибка записи: {exc}"
+                    break
+
+                with self._lock:
+                    self._packets_received += 1
+                    self._bytes_received += len(write_data)
+        finally:
+            try:
+                if self._file:
+                    self._file.close()
+            except Exception:
+                pass
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._running = False
+
 
 # ==============================================================================
 #                              ОСНОВНОЕ ПРИЛОЖЕНИЕ
@@ -514,6 +850,10 @@ class App(tk.Tk):
         self._stop_hook_called = False
         self._click_guard_until = 0.0
 
+        # +++ состояние UDP-приёмника +++
+        self._udp_receiver = None
+        self._last_udp_path = None
+
         # ---------- данные текущего запуска (видны в хуках) ----------
         self._last_angle = None
         self._last_folder = None
@@ -521,10 +861,15 @@ class App(tk.Tk):
         self._last_cfg = None
 
         # ---------- файл настроек ----------
-        try:
-            self._base_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            self._base_dir = os.getcwd()
+        # +++ При запуске из .exe (PyInstaller) — папка рядом с .exe +++
+        #     При запуске .py скрипта — папка со скриптом
+        if getattr(sys, "frozen", False):
+            self._base_dir = os.path.dirname(sys.executable)
+        else:
+            try:
+                self._base_dir = os.path.dirname(os.path.abspath(__file__))
+            except NameError:
+                self._base_dir = os.getcwd()
         self._cfg_path = os.path.join(self._base_dir, CONFIG_FILE)
 
         if not os.path.exists(self._cfg_path):
@@ -546,6 +891,17 @@ class App(tk.Tk):
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # +++ Состояние ping-проверки +++
+        self._ping_in_progress = False
+
+        # +++ Всегда работающий опросчик очереди + прогресс +++
+        self.after(300, self._poll)
+
+        # +++ Периодическая проверка связи (раз в 60 секунд) +++
+        #     Первая проверка — через 1.5 с после старта
+        self.after(1500, self._check_ping_periodic)
+
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self):
@@ -600,10 +956,57 @@ class App(tk.Tk):
                                        command=self._browse_wav)
         self._browse_btn.pack(side="left", padx=(8, 0))
 
-        # ---- 2а. Файл настроек генерации ----
+        # +++ 2б. Приём UDP-пакетов +++
+        udp_frm = ttk.LabelFrame(frm, text="Приём UDP-пакетов", padding=(10, 6))
+        udp_frm.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+
+        udp_cfg = self._cfg.get("udp_receiver", {}) if self._cfg else {}
+        self._udp_enabled_var = tk.BooleanVar(
+            value=bool(udp_cfg.get("enabled", False)))
+        ttk.Checkbutton(udp_frm, text="Принимать и сохранять в файл",
+                        variable=self._udp_enabled_var).pack(side="left")
+
+        udp_fields = ttk.Frame(udp_frm)
+        udp_fields.pack(side="left", padx=(14, 0))
+
+        # IP источника + индикатор связи
+        ttk.Label(udp_fields, text="IP источника:").grid(row=0, column=0,
+                                                          sticky="w")
+        self._udp_ip_var = tk.StringVar(
+            value=str(udp_cfg.get("source_ip", "192.168.0.20")))
+        self._udp_ip_entry = ttk.Entry(udp_fields, textvariable=self._udp_ip_var,
+                                        width=15)
+        self._udp_ip_entry.grid(row=0, column=1, padx=(4, 4))
+        # При выходе из поля IP — перепроверить связь
+        self._udp_ip_entry.bind("<FocusOut>", lambda _e: self._check_ping())
+
+        # +++ Индикатор связи (кликабельный кружок) +++
+        self._ping_indicator = PingIndicator(udp_fields, size=18,
+                                              on_click=self._check_ping)
+        self._ping_indicator.grid(row=0, column=2, padx=(2, 2))
+        self._ping_status_var = tk.StringVar(value="?")
+        ttk.Label(udp_fields, textvariable=self._ping_status_var,
+                  width=5, foreground="#555").grid(row=0, column=3, padx=(0, 12))
+
+        ttk.Label(udp_fields, text="Порт:").grid(row=0, column=4, sticky="w")
+        self._udp_port_var = tk.StringVar(
+            value=str(udp_cfg.get("local_port", 45920)))
+        self._udp_port_entry = ttk.Entry(udp_fields, textvariable=self._udp_port_var,
+                                         width=7)
+        self._udp_port_entry.grid(row=0, column=5, padx=(4, 12))
+
+        ttk.Label(udp_fields, text="Размер пакета:").grid(row=0, column=6,
+                                                           sticky="w")
+        self._udp_pkt_var = tk.StringVar(
+            value=str(udp_cfg.get("packet_size", 1293)))
+        self._udp_pkt_entry = ttk.Entry(udp_fields, textvariable=self._udp_pkt_var,
+                                        width=6)
+        self._udp_pkt_entry.grid(row=0, column=7, padx=(4, 0))
+
+        # ---- 2в. Файл настроек генерации ----
         self._cfg_path_var = tk.StringVar(value=self._cfg_path)
         cfgf = ttk.Frame(frm)
-        cfgf.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        cfgf.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ttk.Label(cfgf, text="Настройки генерации:").pack(side="left")
         ttk.Label(cfgf, textvariable=self._cfg_path_var, foreground="#555").pack(
             side="left", padx=(6, 10))
@@ -614,17 +1017,17 @@ class App(tk.Tk):
         # информация о генерации
         self._info_var = tk.StringVar(value="")
         ttk.Label(frm, textvariable=self._info_var, foreground="#555",
-                  width=80, anchor="w").grid(row=4, column=0, columnspan=3,
+                  width=80, anchor="w").grid(row=5, column=0, columnspan=3,
                                              sticky="w", padx=4, pady=(0, 6))
 
         # ---- 3. Кнопка СТАРТ/СТОП ----
         self._hotbtn = HotButton(frm, command=self._on_hotbutton)
-        self._hotbtn.grid(row=5, column=0, columnspan=3, pady=(2, 8))
+        self._hotbtn.grid(row=6, column=0, columnspan=3, pady=(2, 8))
 
         # ---- 4. Статус ----
         self._status_var = tk.StringVar(value="Готов к работе")
         ttk.Label(frm, textvariable=self._status_var, anchor="w", justify="left",
-                  wraplength=620).grid(row=6, column=0, columnspan=3,
+                  wraplength=620).grid(row=7, column=0, columnspan=3,
                                        sticky="w", padx=4, pady=(2, 4))
 
         self._update_source_ui()
@@ -669,6 +1072,12 @@ class App(tk.Tk):
     def _reload_config(self):
         if self._load_config(show_error=True):
             self._update_source_ui()
+            # Обновляем поля UDP из файла настроек
+            udp_cfg = self._cfg.get("udp_receiver", {})
+            self._udp_enabled_var.set(bool(udp_cfg.get("enabled", False)))
+            self._udp_ip_var.set(str(udp_cfg.get("source_ip", "192.168.0.20")))
+            self._udp_port_var.set(str(udp_cfg.get("local_port", 45920)))
+            self._udp_pkt_var.set(str(udp_cfg.get("packet_size", 1293)))
             total, size_mb = generation_info(self._cfg)
             self._status_var.set(f"Настройки перечитаны: генерация "
                                  f"{self._fmt_time(total)} (~{size_mb:.0f} МБ)")
@@ -779,6 +1188,49 @@ class App(tk.Tk):
         self._last_cfg = copy.deepcopy(self._cfg)
 
         # ==================================================================
+        # +++ ЗАПУСК ПРИЁМНИКА UDP +++
+        # ==================================================================
+        self._udp_receiver = None
+        self._last_udp_path = None
+
+        if self._udp_enabled_var.get():
+            udp_cfg = self._cfg.get("udp_receiver", {})
+            try:
+                udp_port = int(self._udp_port_var.get())
+            except ValueError:
+                messagebox.showerror("Ошибка UDP",
+                                     f"Неверный порт: {self._udp_port_var.get()}")
+                return
+            try:
+                udp_pkt_size = int(self._udp_pkt_var.get())
+            except ValueError:
+                messagebox.showerror("Ошибка UDP",
+                                     f"Неверный размер пакета: "
+                                     f"{self._udp_pkt_var.get()}")
+                return
+
+            udp_ip = self._udp_ip_var.get().strip()
+            udp_filename_base = str(udp_cfg.get("filename", "data.bin"))
+            base, ext = os.path.splitext(udp_filename_base)
+            if not ext:
+                ext = ".bin"
+            udp_filename = f"{base}_{stamp}{ext}"
+            udp_path = os.path.join(folder, udp_filename)
+            self._last_udp_path = udp_path
+
+            self._udp_receiver = UdpReceiver(
+                local_port=udp_port,
+                output_path=udp_path,
+                source_ip=udp_ip,
+                packet_size=udp_pkt_size,
+                strip_header=bool(udp_cfg.get("strip_header", False)),
+                header_size=int(udp_cfg.get("header_size", 13)),
+                status_callback=lambda text: self._ui_queue.put(("status", text)),
+            )
+            self._udp_receiver.start()
+        # ==================================================================
+
+        # ==================================================================
         # ХУК СТАРТ (п.5 ТЗ): вызов вашей функции при старте.
         # Сама функция — ниже, метод user_hook_on_start().
         # ==================================================================
@@ -787,6 +1239,10 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Ошибка в функции старта", str(exc))
             self._status_var.set("Готов к работе")
+            # Останавливаем UDP-приёмник, если он был запущен
+            if self._udp_receiver is not None:
+                self._udp_receiver.stop()
+                self._udp_receiver = None
             return
         # ==================================================================
 
@@ -815,7 +1271,7 @@ class App(tk.Tk):
                   self._last_cfg),
             daemon=True)
         self._worker.start()
-        self.after(100, self._poll)
+        
 
     # ============================== РАБОЧИЙ ПОТОК ==========================
     def _worker_run(self, mode, angle, folder, log_path, wav_path, source_wav, cfg):
@@ -846,6 +1302,17 @@ class App(tk.Tk):
                 log.write("Параметры генерации:\n")
                 for line in json.dumps(cfg, ensure_ascii=False, indent=2).splitlines():
                     log.write("    " + line + "\n")
+            # +++ запись параметров UDP-приёмника в лог +++
+            if self._udp_receiver is not None:
+                udp_cfg = cfg.get("udp_receiver", {})
+                log.write("\nПараметры UDP-приёмника:\n")
+                log.write(f"    Локальный порт : {self._udp_port_var.get()}\n")
+                log.write(f"    IP источника   : "
+                           f"{self._udp_ip_var.get() or '(любой)'}\n")
+                log.write(f"    Размер пакета  : {self._udp_pkt_var.get()}\n")
+                log.write(f"    Файл данных    : {self._last_udp_path}\n")
+                log.write(f"    Без заголовка  : "
+                           f"{udp_cfg.get('strip_header', False)}\n")
             log.write("=" * 72 + "\n\n")
             log.flush()
 
@@ -943,29 +1410,75 @@ class App(tk.Tk):
 
     # ============================ ОПРОС (GUI-поток) ========================
     def _poll(self):
-        # сообщения от рабочего потока
-        try:
-            while True:
-                kind, text = self._ui_queue.get_nowait()
-                if kind == "status":
-                    self._status_var.set(text)
-        except queue.Empty:
-            pass
+        """Всегда работающий опросчик: очередь + прогресс воспроизведения."""
+        # Сообщения от рабочих потоков (status, ping)
+        self._process_ui_queue()
 
-        if self._done_flag:
-            self._finish()
+        if self._active:
+            if self._done_flag:
+                self._finish()
+            elif self._playback_started and self._total_duration:
+                elapsed = time.monotonic() - self._play_t0
+                frac = min(1.0, elapsed / self._total_duration)
+                self._hotbtn.set_progress(frac)
+                udp_info = ""
+                if self._udp_receiver is not None:
+                    stats = self._udp_receiver.get_stats()
+                    udp_info = f"  •  UDP: {stats['packets']} пак."
+                    if stats["bad_size"] > 0 or stats["bad_source"] > 0:
+                        udp_info += (f" (плохих: "
+                                     f"{stats['bad_size'] + stats['bad_source']})")
+                self._status_var.set(
+                    f"Воспроизведение: {self._fmt_time(elapsed)} / "
+                    f"{self._fmt_time(self._total_duration)}"
+                    f"{self._current_segment(elapsed)}{udp_info}")
+
+        self.after(200, self._poll)      # всегда перепланируем
+
+    # ----------------------------------------------------------- ПИНГ ----
+    def _check_ping(self):
+        """Проверка связи с источником (в отдельном потоке, не блокирует GUI)."""
+        if self._ping_in_progress:
+            return
+        ip = self._udp_ip_var.get().strip()
+        if not ip:
+            self._ping_indicator.set_state("unknown")
+            self._ping_status_var.set("?")
             return
 
-        if self._playback_started and self._total_duration:
-            elapsed = time.monotonic() - self._play_t0
-            frac = min(1.0, elapsed / self._total_duration)
-            self._hotbtn.set_progress(frac)      # «хот-бар»
-            self._status_var.set(
-                f"Воспроизведение: {self._fmt_time(elapsed)} / "
-                f"{self._fmt_time(self._total_duration)}{self._current_segment(elapsed)}")
+        self._ping_in_progress = True
+        self._ping_indicator.set_state("unknown")
+        self._ping_status_var.set("…")
 
-        self.after(100, self._poll)
+        def worker():
+            result = check_ping(ip, timeout=2)
+            self._ui_queue.put(("ping", result))
 
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _check_ping_periodic(self):
+        """Автоматическая проверка каждые 60 секунд."""
+        self._check_ping()
+        self.after(60000, self._check_ping_periodic)
+
+    def _process_ui_queue(self):
+        """Разбор сообщений из очереди (от рабочих потоков)."""
+        try:
+            while True:
+                kind, value = self._ui_queue.get_nowait()
+                if kind == "status":
+                    self._status_var.set(value)
+                elif kind == "ping":
+                    self._ping_in_progress = False
+                    if value:
+                        self._ping_indicator.set_state("ok")
+                        self._ping_status_var.set("OK")
+                    else:
+                        self._ping_indicator.set_state("fail")
+                        self._ping_status_var.set("нет")
+        except queue.Empty:
+            pass
+        
     def _current_segment(self, elapsed):
         if not self._seg_offsets:
             return "  •  WAV-файл"
@@ -991,6 +1504,73 @@ class App(tk.Tk):
             self._status_var.set("Остановлено пользователем")
         else:
             self._status_var.set("Воспроизведение завершено")
+
+        # +++ Остановка UDP-приёмника, конвертация в WAV и запись статистики +++
+        if self._udp_receiver is not None:
+            stats = self._udp_receiver.get_stats()
+            self._udp_receiver.stop(timeout=3.0)
+            self._udp_receiver = None
+
+            # ---- Конвертация BIN -> 4-канальный WAV ----
+            wav_created_path = None
+            wav_error = None
+            if (self._last_udp_path
+                    and os.path.isfile(self._last_udp_path)
+                    and stats["packets"] > 0):
+                try:
+                    udp_cfg = (self._last_cfg or {}).get("udp_receiver", {})
+                    sample_rate = int((self._last_cfg or {}).get(
+                        "sample_rate", 46875))
+                    wav_created_path, n_pkt, n_samples = convert_udp_bin_to_wav(
+                        bin_path=self._last_udp_path,
+                        sample_rate=sample_rate,
+                        n_channels=4,
+                        channel_size=160,
+                        strip_header=bool(udp_cfg.get("strip_header", True)),
+                        header_size=int(udp_cfg.get("header_size", 13)),
+                    )
+                except Exception as exc:
+                    wav_error = f"{type(exc).__name__}: {exc}"
+
+            # ---- Дописываем статистику и инфо о WAV в лог ----
+            if self._last_log and os.path.isfile(self._last_log):
+                try:
+                    with open(self._last_log, "a", encoding="utf-8") as log:
+                        log.write("\n" + "=" * 72 + "\n")
+                        log.write("СТАТИСТИКА ПРИЁМА UDP\n")
+                        log.write(f"Файл данных       : {self._last_udp_path}\n")
+                        log.write(f"Принято пакетов   : {stats['packets']}\n")
+                        log.write(f"Принято байт      : {stats['bytes']}\n")
+                        log.write(f"Отброшено (размер): {stats['bad_size']}\n")
+                        log.write(f"Отброшено (IP)    : {stats['bad_source']}\n")
+                        if stats["error"]:
+                            log.write(f"Ошибка приёма     : {stats['error']}\n")
+
+                        if wav_created_path:
+                            sample_rate = int((self._last_cfg or {}).get(
+                                "sample_rate", 46875))
+                            log.write("\nСоздан WAV-файл   : "
+                                      f"{wav_created_path}\n")
+                            log.write(f"Каналов           : 4\n")
+                            log.write(f"Семплов в канале  : {n_samples}\n")
+                            log.write(f"Длительность      : "
+                                      f"{n_samples / sample_rate:.3f} с\n")
+                        elif wav_error:
+                            log.write(f"\nОшибка конвертации в WAV: {wav_error}\n")
+                        log.write("=" * 72 + "\n")
+                except Exception:
+                    pass
+
+            # ---- Итоговая строка статуса ----
+            if reason in ("finished", "manual"):
+                msg = (f"{'Завершено' if reason == 'finished' else 'Остановлено'}. "
+                       f"UDP: принято {stats['packets']} пакетов "
+                       f"({stats['bytes']} байт)")
+                if wav_created_path:
+                    msg += f", WAV: {os.path.basename(wav_created_path)}"
+                elif wav_error:
+                    msg += f", ошибка WAV: {wav_error}"
+                self._status_var.set(msg)
 
         # ХУК СТОП (п.5 ТЗ) — см. метод user_hook_on_stop() ниже.
         self._call_stop_hook(reason)
@@ -1025,6 +1605,10 @@ class App(tk.Tk):
             if self._worker is not None:
                 self._worker.join(timeout=5)
             self._call_stop_hook(self._done_reason or "manual")
+        # +++ останавливаем UDP-приёмник при закрытии окна +++
+        if self._udp_receiver is not None:
+            self._udp_receiver.stop(timeout=3.0)
+            self._udp_receiver = None
         self.destroy()
 
     # ######################################################################
@@ -1038,6 +1622,7 @@ class App(tk.Tk):
     #   self._last_folder — папка результатов (созданная или выбранная)
     #   self._last_log    — путь к лог-файлу
     #   self._last_cfg    — словарь настроек генерации (config.json)
+    #   self._last_udp_path — путь к бинарному файлу UDP-данных (или None)
     # ######################################################################
     def user_hook_on_start(self):
         # ---- ВСТАВЬТЕ ВАШ КОД ЗДЕСЬ ----
