@@ -1,2 +1,5 @@
 Angle_*
+build
+dist
+*.spec
 *.json

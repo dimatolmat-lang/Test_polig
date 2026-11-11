@@ -18,3 +18,49 @@ text
 Свип сделан с непрерывной фазой (интеграл частоты), без «скачка» на 2 кГц.
 Для отрицательных углов папка будет называться Угол_-15 (это допустимое имя).
 Если что-то нужно поправить (порядок в логе, цвета, поведение кнопки) — скажи, подгоню.
+
+Сборка в .exe (PyInstaller)
+Шаг 1. Установите PyInstaller
+bash
+pip install pyinstaller
+Шаг 2. Соберите .exe одной командой
+bash
+pyinstaller --noconfirm --onefile --windowed ^
+    --name "SignalGenerator" ^
+    --collect-all sounddevice ^
+    --collect-all numpy ^
+    signal_generator.py
+Флаг
+Назначение
+--onefile	всё в одном .exe (распаковывается во временную папку при запуске)
+--windowed	без консольного окна (GUI-приложение)
+--name	имя выходного .exe
+--collect-all sounddevice	подхватывает PortAudio DLL и все ресурсы sounddevice
+--collect-all numpy	гарантирует, что все модули numpy попадут в сборку
+
+Если нужен значок: добавьте --icon "icon.ico".
+
+Шаг 3. Где взять результат
+После сборки:
+
+text
+signal_generator.py
+build/                     ← временная папка (можно удалить)
+dist/
+  SignalGenerator.exe      ← ГОТОВЫЙ ФАЙЛ
+Шаг 4. Как это работает при запуске .exe
+При запуске SignalGenerator.exe:
+
+PyInstaller распаковывает внутренности во временную папку (sys._MEIPASS)
+Код определяет, что он заморожен (sys.frozen == True)
+В качестве рабочей папки (self._base_dir) берётся папка рядом с .exe: os.path.dirname(sys.executable)
+В этой папке создаётся config.json (при первом запуске)
+При нажатии «СТАРТ» там же создаются папки Angle_<N> с логами, Исходник.wav, data_*.bin, data_*.wav
+text
+C:\...\SignalGenerator.exe      ← запускаете это
+C:\...\config.json              ← создаётся автоматически
+C:\...\Angle_0\                 ← создаётся при первом СТАРТ
+        Лог_2026-11-11_10-30-00.txt
+        Исходник.wav
+        data_2026-11-11_10-30-00.bin
+        data_2026-11-11_10-30-00.wav
