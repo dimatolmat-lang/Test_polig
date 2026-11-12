@@ -100,7 +100,7 @@ DEFAULT_CONFIG = {
     "udp_receiver": {
         "enabled": False,                        # включить приём при старте
         "local_port": 45920,                     # локальный порт для прослушивания
-        "source_ip": "192.168.0.pi9",             # IP источника ("" = любой)
+        "source_ip": "192.168.0.9",             # IP источника ("" = любой)
         "packet_size": 1293,                     # ожидаемый размер пакета, байт
         "header_size": 13,                       # размер заголовка в пакете
         "filename": "data.bin",                  # имя файла (в папке результатов)
@@ -961,8 +961,7 @@ class App(tk.Tk):
         udp_frm.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 4))
 
         udp_cfg = self._cfg.get("udp_receiver", {}) if self._cfg else {}
-        self._udp_enabled_var = tk.BooleanVar(
-            value=bool(udp_cfg.get("enabled", False)))
+        self._udp_enabled_var = tk.BooleanVar(value = True)
         ttk.Checkbutton(udp_frm, text="Принимать и сохранять в файл",
                         variable=self._udp_enabled_var).pack(side="left")
 
@@ -1074,7 +1073,7 @@ class App(tk.Tk):
             self._update_source_ui()
             # Обновляем поля UDP из файла настроек
             udp_cfg = self._cfg.get("udp_receiver", {})
-            self._udp_enabled_var.set(bool(udp_cfg.get("enabled", False)))
+            self._udp_enabled_var.set(True)
             self._udp_ip_var.set(str(udp_cfg.get("source_ip", "192.168.0.20")))
             self._udp_port_var.set(str(udp_cfg.get("local_port", 45920)))
             self._udp_pkt_var.set(str(udp_cfg.get("packet_size", 1293)))
